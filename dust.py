@@ -1,4 +1,4 @@
-"""Minimal FWDes implementation: forward-only transformer training with SGD.
+"""Minimal DUST implementation: forward-only transformer training with SGD.
 
 No autograd or backward pass is used.
 """
@@ -270,7 +270,7 @@ def average_ranks(tensor):
     return tensor
 
 
-class FWDes:
+class DUST:
     """Estimate activation errors using forward evaluations, then form local outer products."""
 
     def __init__(self, model, settings, seed=42, rank=0, world=1):
@@ -671,7 +671,7 @@ def main():
     # Every rank sees the same batch; only the perturbation population is divided across ranks.
     model = make_model(config, device, args.seed)
     optimizer = make_optimizer(model, settings)
-    estimator = FWDes(model, settings, args.seed, rank, world)
+    estimator = DUST(model, settings, args.seed, rank, world)
     if args.output.exists() and any(args.output.iterdir()):
         raise FileExistsError(f'Choose an empty output directory: {args.output}')
     if rank == 0:

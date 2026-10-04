@@ -24,7 +24,7 @@ Face's `tokenizers` library on the **first 200,000 documents** of FineWeb's
 
 BPE learns frequent byte-pair merges; it does not use backpropagation. The JSON
 stores the resulting vocabulary and merge rules. The tokenizer stays fixed and
-is shared by FWDes and the backpropagation baseline.
+is shared by DUST and the backpropagation baseline.
 
 Data preparation skips those 200,000 documents before collecting transformer
 training data. The 1M/10M budgets count transformer training tokens; they do not

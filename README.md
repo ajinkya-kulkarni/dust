@@ -1,10 +1,12 @@
-# FWDes: minimal implementation
+# DUST
+
+This is a minimal implementation of our research: <https://qlabs.sh/research/dust>
 
 Train a transformer using forward evaluations and SGD, without backpropagation.
 This minimal implementation preserves the paper's estimator and tuned defaults
 while omitting execution optimizations used in the full experiments.
 
-[`fwdes.py`](fwdes.py) contains the model, algorithm, and training loop. A simple
+[`dust.py`](dust.py) contains the model, algorithm, and training loop. A simple
 [backpropagation SGD baseline](baselines/backprop.py) uses the same model and data.
 
 ## Installation
@@ -36,19 +38,19 @@ Each held-out split contains 544 sequences of 2,048 prediction tokens.
 The fixed BPE-4096 tokenizer is included; retraining is optional.
 Its training recipe and script are in [`tokenizer/`](tokenizer/README.md).
 
-## FWDes
+## DUST
 
 Train with the default population of **16,384** on eight GPUs:
 
 ```bash
-torchrun --standalone --nproc_per_node=8 fwdes.py --tokens 1M --output runs/1m
-torchrun --standalone --nproc_per_node=8 fwdes.py --tokens 10M --output runs/10m
+torchrun --standalone --nproc_per_node=8 dust.py --tokens 1M --output runs/1m
+torchrun --standalone --nproc_per_node=8 dust.py --tokens 10M --output runs/10m
 ```
 
 For a smaller, single-GPU run:
 
 ```bash
-python fwdes.py --tokens 1M --population 256 --output runs/1m-p256
+python dust.py --tokens 1M --population 256 --output runs/1m-p256
 ```
 
 Supported populations are **256, 1024, 4096, and 16384**, using respectively
@@ -74,3 +76,7 @@ python baselines/backprop.py --tokens 10M --output runs/bp-10m
 Each run saves its configuration, metrics, a validation-selected `best.pt`, and
 `result.json` containing the selected checkpoint's test loss. Use a new output
 directory for each run. Data, checkpoints, and logs are stored locally.
+
+## License
+
+Released under the [MIT License](LICENSE).

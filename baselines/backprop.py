@@ -1,4 +1,4 @@
-"""Minimal SGD backpropagation baseline with the same model, data, and evaluation as FWDes."""
+"""Minimal SGD backpropagation baseline with the same model, data, and evaluation as DUST."""
 import argparse
 from dataclasses import asdict
 import json
@@ -10,7 +10,7 @@ import time
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fwdes import GPTConfig, evaluate, file_hash, load_sequences, make_model
+from dust import GPTConfig, evaluate, file_hash, load_sequences, make_model
 
 
 DEFAULT_CONFIGS = {
@@ -102,7 +102,7 @@ def main():
                                parameters=sum(p.numel() for p in g['params']))
                           for g in optimizer.param_groups],
         source_sha256=file_hash(Path(__file__)),
-        model_source_sha256=file_hash(Path(__file__).resolve().parents[1] / 'fwdes.py'),
+        model_source_sha256=file_hash(Path(__file__).resolve().parents[1] / 'dust.py'),
         torch_version=torch.__version__,
         data_sha256={name: file_hash(path) for name, path in paths.items()},
     )
