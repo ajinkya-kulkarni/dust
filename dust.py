@@ -1,6 +1,17 @@
 """Minimal DUST implementation: forward-only transformer training with SGD.
 
-No autograd or backward pass is used.
+No autograd or backward pass is used. One update (DUST.step):
+  1. A clean forward caches every layer's input and output and the per-token losses.
+  2. Direct draws jitter a layer's output at every token, y + sigma * a with a ~ N(0, I), rerun the
+     forward and reward each token's jitter with the loss reduction at that token. The
+     reward-weighted noise, averaged over draws, is the estimated error at the layer's output.
+  3. The attention internals (queries, keys, values, value-embedding gates, value embeddings) are
+     credited through the estimated error at the attention output instead,
+     recomputing only their block's attention.
+  4. The head is jittered on the cached logits, one 256-column slab at a time.
+  5. The outer product of each layer's estimated output error with its cached input, summed over
+     tokens, is the layer's weight gradient, as in backprop. The 2L residual mixing scalars use
+     two-sided weight-space ES. Then one SGD step.
 """
 import argparse
 from contextlib import nullcontext
@@ -18,7 +29,10 @@ from torch.nn import functional as F
 
 
 def attention(q, k, v, window):
-    """Causal attention with a left window; tensors have shape [batch, token, head, dim]."""
+    """Causal attention with a left window; tensors have shape [batch, token, head, dim].
+
+    A query at position s sees keys at s - window to s.
+    """
     length = q.shape[1]
     positions = torch.arange(length, device=q.device)
     distance = positions[:, None] - positions[None, :]
@@ -37,6 +51,7 @@ class GPTConfig:
     n_head: int = 8
     n_kv_head: int = 8
     n_embd: int = 512
+    # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
 
 
@@ -45,6 +60,7 @@ def norm(x):
 
 
 def has_ve(layer_idx, n_layer):
+    """Value embeddings on every other block, counting back from the last."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
@@ -66,6 +82,8 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # The value embedding is scaled per head by 2 * sigmoid(gate), read from the block input's first 32
+        # channels.
         self.ve_gate_channels = 32
         self.ve_gate = (
             nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
@@ -108,6 +126,7 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
+        # Pre-norm block. attn.c_proj and mlp.c_proj are the "writers" into the residual stream.
         x = x + self.attn(norm(x), ve, cos_sin, window_size)
         x = x + self.mlp(norm(x))
         return x
@@ -123,7 +142,10 @@ class GPT(nn.Module):
             'wte': nn.Embedding(padded_vocab, config.n_embd),
             'h': nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)  # untied from the embedding
+        # The stream entering block i is resid_lambdas[i] * x + x0_lambdas[i] * x0, a learned mix of the
+        # previous block's output and the normalized token embedding. These 2L scalars are trained
+        # with weight-space ES (DUST.scalar_gradients).
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         head_dim = config.n_embd // config.n_head
@@ -146,7 +168,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)  # make_model re-initializes both c_proj weights
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
         self.resid_lambdas.fill_(1.0)
@@ -159,6 +181,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         (self.cos, self.sin) = (cos, sin)
+        # Token and value embeddings are stored in bfloat16 on the GPU
         if self.transformer.wte.weight.device.type == 'cuda':
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
@@ -191,7 +214,7 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin, self.window_sizes[i])
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
-        logits = 15 * torch.tanh(logits / 15)
+        logits = 15 * torch.tanh(logits / 15)  # soft cap, repeated in DUST.head_error
         if targets is not None:
             return F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1),
@@ -202,13 +225,14 @@ class GPT(nn.Module):
 
 @dataclass
 class Recipe:
-    writers: list[int]
-    hidden: list[int]
-    hubs: list[int]
-    embedding: int
-    head: int
-    local: dict[str, int]
-    nrep: int
+    """Draws per update for each part of the model, summed over GPUs. Lists have one entry per block."""
+    writers: list[int]      # draws per block for the attention and MLP output projections (c_proj)
+    hidden: list[int]       # draws per block for the MLP's first layer (mlp.c_fc)
+    hubs: list[int]         # draws per block for the attention output, before attn.c_proj
+    embedding: int          # draws for the token embedding
+    head: int               # draws for the output head (lm_head)
+    local: dict[str, int]   # draws per block for each attention internal: q, v, gate, k, ve
+    nrep: int               # draws run together in one forward pass
     lr: float
     momentum: float
     gamma: float = 0.98  # attention-internal credit decay per token of lag
@@ -242,11 +266,12 @@ DEFAULT_CONFIGS = {
     },
 }
 
+# Draws per forward pass (the batch is repeated this many times).
 DRAW_CHUNK_SIZES = {256: 2, 1024: 8, 4096: 8, 16384: 16}
 
 
 def recipe(tokens, population):
-    """Build a saved SGD configuration; population counts direct-loss draws only."""
+    """Build a saved config, population counts direct-loss draws only. """
     optimizer = DEFAULT_CONFIGS[tokens]['optimizer'][population]
     nrep = DRAW_CHUNK_SIZES[population]
     scale = population // 256
@@ -271,7 +296,13 @@ def average_ranks(tensor):
 
 
 class DUST:
-    """Estimate activation errors using forward evaluations, then form local outer products."""
+    """
+    The actual algorithm.
+
+    Forward hooks on every Linear and Embedding capture its input and output during the clean pass and add the
+    current jitter to its output during a draw. Pre-hooks on attn.c_proj add the virtual sites o@{layer}, the
+    attention output before the projection. Each GPU draws different noise for the same batch.
+    """
 
     def __init__(self, model, settings, seed=42, rank=0, world=1):
         self.model, self.settings, self.world = model, settings, world
@@ -336,7 +367,7 @@ class DUST:
             self.capturing = False
 
     def direct_errors(self, sites, draws, sigma):
-        """One-sided loss drops, centered across each chunk of draws without rescaling."""
+        """One-sided loss drops, centered across each chunk of draws. """
         n = self.settings.nrep
         x, y = self.x.repeat(n, 1), self.y.repeat(n, 1)
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
@@ -362,7 +393,12 @@ class DUST:
         return {s: error / draws for s, error in errors.items()}
 
     def head_error(self, draws, sigma=0.05):
-        """Perturb one vocabulary slab at a time; recompute CE from its changed logits."""
+        """Perturb one vocabulary slab at a time; recompute CE from its changed logits.
+
+        Each chunk jitters one 256-column slab of the cached logits, and the loss is recomputed from the
+        cached sums of the other slabs. This is much cheaper than a forward pass, and each reward only
+        reflects 256 jittered columns instead of all 4096.
+        """
         n, b, t = self.settings.nrep, self.batch, self.length
         raw = self.outputs['lm_head']
         vocab, slab = self.model.config.vocab_size, 256
@@ -401,7 +437,13 @@ class DUST:
         return error / (draws // slabs)
 
     def local_errors(self, kind, draws, targets, sigma=0.05):
-        """Score attention-output changes against estimated output errors (no derivatives)."""
+        """Score attention-output changes against estimated output errors (no derivatives).
+
+        Each draw recomputes the block's attention output from the cached clean activations and scores the
+        change per head against the output's estimated error (`targets`, computed by direct_errors on the 
+        o@{layer} sites). Queries keep their own token's score; the other kinds sum the scores of later
+        tokens, decayed by gamma per token.
+        """
         cfg = self.model.config
         n, b, t, h, d = self.settings.nrep, self.batch, self.length, cfg.n_head, cfg.n_embd // cfg.n_head
         site_suffix = {'q': 'attn.c_q', 'k': 'attn.c_k', 'v': 'attn.c_v', 'gate': 'attn.ve_gate'}
@@ -432,6 +474,7 @@ class DUST:
             baseline = attention(qp, kp, values.to(self.dtype), window)
             positions = torch.arange(t, device=self.device)
             lag = positions[None, :] - positions[:, None]  # [perturbation position, output position]
+            # credit[t, s]: how much of output s's score goes to the jitter at t, inside the causal window
             credit = ((lag >= 0) & (lag <= window)).float() * self.settings.gamma ** lag.clamp(min=0)
             clean[i] = q, k, z, ve, qp, kp, values, baseline, credit
 
@@ -474,7 +517,7 @@ class DUST:
         return {sites[i]: errors[i] / draws for i in layers}
 
     def reassemble(self, site, error):
-        """The exact local linear map: error times input, or scatter-add for an embedding."""
+        """The exact local linear map: error times input, or scatter-add for an embedding. """
         x, module = self.inputs[site], self.modules[site]
         if isinstance(module, nn.Embedding):
             weight_error = torch.zeros_like(module.weight, dtype=torch.float32)
@@ -482,6 +525,7 @@ class DUST:
         return torch.einsum('btd,bti->di', error, x)
 
     def scalar_gradients(self, draws, sigma=0.03):
+        """Two-sided weight-space ES for the 2L residual mixing scalars, rewarded by the summed token loss."""
         parameters = [self.model.resid_lambdas, self.model.x0_lambdas]
         original = [p.clone() for p in parameters]
         estimate = torch.zeros(2, self.model.config.n_layer, device=self.device)
@@ -520,6 +564,9 @@ class DUST:
         error = self.direct_errors([site], r.embedding // world, 0.2)[site]
         gradients[site + '.weight'] = self.reassemble(site, error)
 
+        # Attention outputs, each block alone. The deeper half moves the loss too little at 0.2 for a readable
+        # reward, so it uses 0.4. The targets are averaged over GPUs so that every GPU scores the attention
+        # internals against the estimate from the whole population.
         targets = {}
         for layer in range(self.model.config.n_layer):
             site = f'o@{layer}'
@@ -532,6 +579,7 @@ class DUST:
                 gradients[site + '.weight'] = self.reassemble(site, error)
         gradients.update(self.scalar_gradients(8 // world))
 
+        # Dividing the summed estimates by the token count gives the gradient of the mean loss.
         valid_tokens = (y != -1).sum()
         optimizer.zero_grad(set_to_none=True)
         for name, parameter in self.model.named_parameters():
@@ -586,6 +634,8 @@ def make_model(config, device, seed):
         model = GPT(config)
     model.to_empty(device=device)
     model.init_weights()
+    # init output projections at std 1.5 / sqrt(fan_in)
+    # instead of the zeros init_weights sets.
     with torch.no_grad():
         for name, module in model.named_modules():
             if 'c_proj' in name and isinstance(module, nn.Linear):
