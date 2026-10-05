@@ -103,6 +103,7 @@ def main():
                           for g in optimizer.param_groups],
         source_sha256=file_hash(Path(__file__)),
         model_source_sha256=file_hash(Path(__file__).resolve().parents[1] / 'dust.py'),
+        model_sha256=file_hash(Path(__file__).resolve().parents[1] / 'model.py'),
         torch_version=torch.__version__,
         data_sha256={name: file_hash(path) for name, path in paths.items()},
     )

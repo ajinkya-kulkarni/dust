@@ -6,7 +6,7 @@ Train a transformer using forward evaluations and SGD, without backpropagation.
 This minimal implementation preserves the paper's estimator and tuned defaults
 while omitting execution optimizations used in the full experiments.
 
-[`dust.py`](dust.py) contains the model, algorithm, and training loop. A simple
+[`model.py`](model.py) contains the model, and [`dust.py`](dust.py) the algorithm and training loop. A simple
 [backpropagation SGD baseline](baselines/backprop.py) uses the same model and data.
 
 ## Installation
