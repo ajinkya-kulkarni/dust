@@ -134,3 +134,33 @@ These are smoke-test observations, not final benchmark claims.
 - `train_bp.py`: ordinary AdamW/backprop baseline
 - `train_dust.py`: end-to-end DUST training
 - `grad_cosine.py`: DUST-vs-backprop gradient alignment
+
+
+## Split head credit assignment
+
+The first StarDist DUST run exposed a specific failure mode: the objectness rows of the dense head had high gradient alignment while the 16-ray rows were dominated by estimator noise. The default DUST path on this branch now separates the final-head estimator:
+
+- perturb only objectness head outputs and score them with objectness loss;
+- perturb only radial head outputs and score them with radial loss (including the configured ray weight);
+- combine the two estimated output errors before reconstructing the head weight gradient.
+
+Shared transformer layers still use the original global StarDist loss estimator. This keeps the change isolated to the head bottleneck.
+
+The new behavior is the default:
+
+```bash
+uv run python vision/grad_cosine.py \
+  --device cpu \
+  --populations 16 64 256 1024
+```
+
+For the previous global-scalar head estimator:
+
+```bash
+uv run python vision/grad_cosine.py \
+  --device cpu \
+  --head-credit global \
+  --populations 16 64 256 1024
+```
+
+Training also defaults to split head credit. Use `--head-credit global` only to reproduce the earlier baseline.
