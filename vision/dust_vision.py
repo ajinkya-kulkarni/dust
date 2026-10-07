@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 
 from data import BatchTargets
-from task import segmentation_loss_components_per_sample, segmentation_loss_per_sample
+from task import (
+    segmentation_loss_components_per_sample,
+    segmentation_loss_components_per_token,
+    segmentation_loss_per_sample,
+)
 
 
 class ForwardOnlyDUST:
@@ -21,6 +25,7 @@ class ForwardOnlyDUST:
         draw_chunk: int = 8,
         seed: int = 123,
         split_head_credit: bool = True,
+        token_local_credit: bool = True,
         ray_weight: float = 0.5,
     ) -> None:
         self.model = model
@@ -38,6 +43,7 @@ class ForwardOnlyDUST:
         self.population = population
         self.draw_chunk = min(draw_chunk, population)
         self.split_head_credit = split_head_credit
+        self.token_local_credit = token_local_credit
         self.ray_weight = ray_weight
         self.device = next(model.parameters()).device
         if self.device.type == "mps":
@@ -95,6 +101,24 @@ class ForwardOnlyDUST:
             kwargs["generator"] = self.generator
         return torch.randn(*shape, **kwargs)
 
+    def _uses_token_local_credit(self, site: str) -> bool:
+        if not self.token_local_credit:
+            return False
+        local_sites = getattr(self.model, "local_credit_sites", ())
+        return site in local_sites
+
+    def _token_loss_components(
+        self,
+        prediction: dict[str, torch.Tensor],
+        targets: BatchTargets,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return segmentation_loss_components_per_token(
+            prediction,
+            targets,
+            token_grid=int(self.model.grid),
+            local_grid=int(self.model.local_grid),
+        )
+
     @torch.no_grad()
     def _estimate_head_component_error(
         self,
@@ -124,17 +148,31 @@ class ForwardOnlyDUST:
                 expanded_images = images.repeat((2 * n, 1, 1, 1))
                 expanded_targets = self._repeat_targets(targets, 2 * n)
                 pred = self.model(expanded_images)
-                obj_loss, ray_loss = segmentation_loss_components_per_sample(
-                    pred, expanded_targets
-                )
-                component_loss = obj_loss if component == "objectness" else ray_loss
-                losses = (scale * component_loss).reshape(2, n, b)
+                if self._uses_token_local_credit("head"):
+                    obj_loss, ray_loss = self._token_loss_components(
+                        pred, expanded_targets
+                    )
+                    component_loss = obj_loss if component == "objectness" else ray_loss
+                    losses = (scale * component_loss).reshape(2, n, b, t)
+                else:
+                    obj_loss, ray_loss = segmentation_loss_components_per_sample(
+                        pred, expanded_targets
+                    )
+                    component_loss = obj_loss if component == "objectness" else ray_loss
+                    losses = (scale * component_loss).reshape(2, n, b)
             finally:
                 self.jitter_site = None
                 self.jitter = None
 
             directional = (losses[0] - losses[1]) / (2 * self.sigma)
-            estimate += torch.einsum("nb,nbtd->btd", directional.float(), noise)
+            if directional.ndim == 3:
+                estimate += torch.einsum(
+                    "nbt,nbtd->btd", directional.float(), noise
+                )
+            else:
+                estimate += torch.einsum(
+                    "nb,nbtd->btd", directional.float(), noise
+                )
             completed += n
 
         return estimate / self.population
@@ -174,6 +212,50 @@ class ForwardOnlyDUST:
         return obj_error + ray_error
 
     @torch.no_grad()
+    def _estimate_token_local_output_error(
+        self,
+        site: str,
+        images: torch.Tensor,
+        targets: BatchTargets,
+    ) -> torch.Tensor:
+        """Estimate activation error with exact per-token downstream loss credit."""
+        clean = self.outputs[site]
+        if clean.ndim != 3:
+            raise ValueError(f"Expected [B,T,D] output at {site}, got {tuple(clean.shape)}")
+        b, t, d = clean.shape
+        estimate = torch.zeros_like(clean, dtype=torch.float32)
+        completed = 0
+
+        while completed < self.population:
+            n = min(self.draw_chunk, self.population - completed)
+            noise = self._noise((n, b, t, d), clean.device)
+            signs = torch.cat((torch.ones(n), -torch.ones(n))).to(clean.device)
+            jitter = signs[:, None, None, None] * self.sigma * noise.repeat(2, 1, 1, 1)
+            self.jitter_site = site
+            self.jitter = jitter.reshape(2 * n * b, t, d)
+            try:
+                expanded_images = images.repeat((2 * n, 1, 1, 1))
+                expanded_targets = self._repeat_targets(targets, 2 * n)
+                pred = self.model(expanded_images)
+                obj_token, ray_token = self._token_loss_components(
+                    pred, expanded_targets
+                )
+                losses = (obj_token + self.ray_weight * ray_token).reshape(
+                    2, n, b, t
+                )
+            finally:
+                self.jitter_site = None
+                self.jitter = None
+
+            directional = (losses[0] - losses[1]) / (2 * self.sigma)
+            estimate += torch.einsum(
+                "nbt,nbtd->btd", directional.float(), noise
+            )
+            completed += n
+
+        return estimate / self.population
+
+    @torch.no_grad()
     def estimate_output_error(
         self,
         site: str,
@@ -182,6 +264,8 @@ class ForwardOnlyDUST:
     ) -> torch.Tensor:
         if site == "head" and self.split_head_credit:
             return self.estimate_head_output_error_split(images, targets)
+        if self._uses_token_local_credit(site):
+            return self._estimate_token_local_output_error(site, images, targets)
 
         clean = self.outputs[site]
         if clean.ndim != 3:
