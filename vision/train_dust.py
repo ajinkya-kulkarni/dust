@@ -64,10 +64,15 @@ def main() -> None:
     p.add_argument("--head-credit", choices=["split", "global"], default="split")
     p.add_argument(
         "--spatial-credit",
-        choices=["local", "global"],
+        choices=["local", "sampled", "global"],
         default="local",
-        help="Use exact token-local loss credit at eligible late sites.",
+        help=(
+            "local: exact token-local credit at eligible late sites; "
+            "sampled: also use sampled one-token-at-a-time credit at cross-token sites; "
+            "global: old global scalar credit."
+        ),
     )
+    p.add_argument("--credit-tokens", type=int, default=16)
     p.add_argument("--sigma", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--mode", choices=["full", "head"], default="full")
@@ -123,7 +128,9 @@ def main() -> None:
         draw_chunk=args.draw_chunk,
         seed=args.seed + 123,
         split_head_credit=args.head_credit == "split",
-        token_local_credit=args.spatial_credit == "local",
+        token_local_credit=args.spatial_credit in {"local", "sampled"},
+        sampled_token_credit=args.spatial_credit == "sampled",
+        credit_tokens=args.credit_tokens,
     )
     params = [p for module in dust.modules.values() for p in module.parameters()]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
