@@ -11,10 +11,17 @@ def segmentation_loss_per_sample(
     prediction: dict[str, torch.Tensor],
     targets: BatchTargets,
     offset_weight: float = 2.0,
+    fg_pos_weight: float = 4.0,
 ) -> torch.Tensor:
     fg_logits = prediction["fg_logits"]
     offsets = prediction["offsets"]
-    fg_loss = F.binary_cross_entropy_with_logits(fg_logits, targets.foreground, reduction="none")
+    pos_weight = torch.as_tensor(fg_pos_weight, device=fg_logits.device, dtype=fg_logits.dtype)
+    fg_loss = F.binary_cross_entropy_with_logits(
+        fg_logits,
+        targets.foreground,
+        reduction="none",
+        pos_weight=pos_weight,
+    )
     fg_loss = fg_loss.flatten(1).mean(1)
     off = F.smooth_l1_loss(offsets, targets.offsets, reduction="none").sum(1)
     mask = targets.foreground
