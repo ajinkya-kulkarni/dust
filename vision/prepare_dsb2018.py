@@ -33,7 +33,6 @@ def main() -> None:
         nuclei = 0
         nonempty = 0
         for i in range(count):
-            _, targets = None, None
             image, instances, objectness, rays = ds[i]
             n = int(instances.max().item())
             nuclei += n
