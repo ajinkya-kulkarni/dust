@@ -9,12 +9,12 @@ import torch.nn.functional as F
 from data import BatchTargets
 
 
-def segmentation_loss_per_sample(
+def segmentation_loss_components_per_sample(
     prediction: dict[str, torch.Tensor],
     targets: BatchTargets,
-    ray_weight: float = 0.5,
     obj_pos_weight: float = 4.0,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return unweighted objectness and radial losses for each sample."""
     obj_logits = prediction["obj_logits"]
     rays = prediction["rays"]
     pos_weight = torch.as_tensor(
@@ -30,6 +30,18 @@ def segmentation_loss_per_sample(
     ray = F.smooth_l1_loss(rays, targets.rays, reduction="none").mean(1)
     mask = targets.instances > 0
     ray_loss = (ray * mask).flatten(1).sum(1) / mask.flatten(1).sum(1).clamp_min(1)
+    return obj_loss, ray_loss
+
+
+def segmentation_loss_per_sample(
+    prediction: dict[str, torch.Tensor],
+    targets: BatchTargets,
+    ray_weight: float = 0.5,
+    obj_pos_weight: float = 4.0,
+) -> torch.Tensor:
+    obj_loss, ray_loss = segmentation_loss_components_per_sample(
+        prediction, targets, obj_pos_weight=obj_pos_weight
+    )
     return obj_loss + ray_weight * ray_loss
 
 
