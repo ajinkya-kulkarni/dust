@@ -8,6 +8,9 @@ dependencies = [
     "torch==2.10.0",
     "tokenizers==0.23.1",
     "datasets==4.8.4",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "tifffile>=2025.1.10",
 ]
 
 [tool.uv]
