@@ -96,6 +96,15 @@ class TinyInstanceTransformer(nn.Module):
 
         self.patch_embed = nn.Linear(self.patch_area, dim, bias=False)
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
+        last = depth - 1
+        # These activations have no later cross-token mixing. Their downstream
+        # StarDist loss therefore decomposes exactly by encoder token.
+        self.local_credit_sites = (
+            "head",
+            f"blocks.{last}.attn.proj",
+            f"blocks.{last}.fc1",
+            f"blocks.{last}.fc2",
+        )
         self.head = nn.Linear(
             dim,
             self.output_positions_per_token * (1 + n_rays),
