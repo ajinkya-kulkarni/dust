@@ -50,7 +50,8 @@ def main() -> None:
             model.train()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model.state_dict(), "args": vars(args)}, args.output)
+    metadata = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    torch.save({"model": model.state_dict(), "args": metadata}, args.output)
     print(f"saved {args.output}")
 
 
