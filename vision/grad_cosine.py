@@ -9,7 +9,11 @@ from torch.utils.data import DataLoader
 from data import DSB2018Dataset, collate_batch
 from dust_vision import ForwardOnlyDUST
 from model import TinyInstanceTransformer
-from task import segmentation_loss_per_sample
+from task import (
+    segmentation_loss_components_per_sample,
+    segmentation_loss_components_per_token,
+    segmentation_loss_per_sample,
+)
 
 
 def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -41,6 +45,12 @@ def main() -> None:
     p.add_argument("--sigma", type=float, default=0.1)
     p.add_argument("--draw-chunk", type=int, default=8)
     p.add_argument("--head-credit", choices=["split", "global"], default="split")
+    p.add_argument(
+        "--spatial-credit",
+        choices=["local", "global"],
+        default="local",
+        help="Use exact token-local loss credit at eligible late sites, or the old image-global scalar credit.",
+    )
     p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--image-size", type=int, default=256)
@@ -56,7 +66,10 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    print(f"device={device} head_credit={args.head_credit}")
+    print(
+        f"device={device} head_credit={args.head_credit} "
+        f"spatial_credit={args.spatial_credit}"
+    )
 
     ds = DSB2018Dataset(
         args.data_dir,
@@ -94,7 +107,24 @@ def main() -> None:
 
     model.requires_grad_(True)
     model.zero_grad(set_to_none=True)
-    loss = segmentation_loss_per_sample(model(images), targets).mean()
+    clean_pred = model(images)
+    global_obj, global_ray = segmentation_loss_components_per_sample(clean_pred, targets)
+    token_obj, token_ray = segmentation_loss_components_per_token(
+        clean_pred,
+        targets,
+        token_grid=model.grid,
+        local_grid=model.local_grid,
+    )
+    obj_decomp_err = (global_obj - token_obj.sum(1)).abs().max().item()
+    ray_decomp_err = (global_ray - token_ray.sum(1)).abs().max().item()
+    print(
+        f"token_loss_decomposition max_abs_error: "
+        f"obj={obj_decomp_err:.3e} rays={ray_decomp_err:.3e}"
+    )
+    if obj_decomp_err > 1e-5 or ray_decomp_err > 1e-5:
+        raise RuntimeError("Per-token loss contributions do not sum to the global loss.")
+
+    loss = segmentation_loss_per_sample(clean_pred, targets).mean()
     loss.backward()
     module = dict(model.named_modules())[args.site]
     true_grad = module.weight.grad.detach().float().clone()
@@ -123,6 +153,7 @@ def main() -> None:
             draw_chunk=args.draw_chunk,
             seed=args.seed + 1000,
             split_head_credit=args.head_credit == "split",
+            token_local_credit=args.spatial_credit == "local",
         )
         try:
             est, _ = dust.estimate_site_gradient(args.site, images, targets, capture=True)
