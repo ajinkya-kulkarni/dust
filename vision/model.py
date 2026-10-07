@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,28 +59,48 @@ class Block(nn.Module):
 
 
 class TinyInstanceTransformer(nn.Module):
-    """Tiny all-Linear transformer with a StarDist-like dense output head."""
+    """DUST-friendly transformer for 256x256 DSB2018 StarDist prediction."""
 
     def __init__(
         self,
-        image_size: int = 32,
-        patch_size: int = 4,
-        dim: int = 64,
+        image_size: int = 256,
+        patch_size: int = 16,
+        output_stride: int = 4,
+        grid_offset: int = 2,
+        dim: int = 96,
         depth: int = 2,
         heads: int = 4,
-        n_rays: int = 16,
+        n_rays: int = 32,
+        ray_scale: float = 16.0,
     ) -> None:
         super().__init__()
         if image_size % patch_size:
             raise ValueError("image_size must be divisible by patch_size")
+        if patch_size % output_stride:
+            raise ValueError("patch_size must be divisible by output_stride")
+        if image_size % output_stride:
+            raise ValueError("image_size must be divisible by output_stride")
+
         self.image_size = image_size
         self.patch_size = patch_size
+        self.output_stride = output_stride
+        self.grid_offset = grid_offset
         self.n_rays = n_rays
+        self.ray_scale = ray_scale
+
         self.grid = image_size // patch_size
+        self.output_grid = image_size // output_stride
+        self.local_grid = patch_size // output_stride
+        self.output_positions_per_token = self.local_grid * self.local_grid
         self.patch_area = patch_size * patch_size
+
         self.patch_embed = nn.Linear(self.patch_area, dim, bias=False)
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
-        self.head = nn.Linear(dim, self.patch_area * (1 + n_rays), bias=False)
+        self.head = nn.Linear(
+            dim,
+            self.output_positions_per_token * (1 + n_rays),
+            bias=False,
+        )
         self.register_buffer("pos", fixed_2d_position_embedding(self.grid, dim), persistent=False)
 
     def patchify(self, images: torch.Tensor) -> torch.Tensor:
@@ -88,12 +109,12 @@ class TinyInstanceTransformer(nn.Module):
 
     def unpatchify(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         b, _, _ = raw.shape
-        p = self.patch_size
         g = self.grid
+        lg = self.local_grid
         channels = 1 + self.n_rays
-        raw = raw.reshape(b, g, g, p, p, channels)
+        raw = raw.reshape(b, g, g, lg, lg, channels)
         raw = raw.permute(0, 1, 3, 2, 4, 5).reshape(
-            b, self.image_size, self.image_size, channels
+            b, self.output_grid, self.output_grid, channels
         )
         obj_logits = raw[..., 0]
         rays = F.softplus(raw[..., 1:]).permute(0, 3, 1, 2)
