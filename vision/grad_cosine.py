@@ -32,6 +32,7 @@ def split_head_rows(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", type=Path, required=True)
+    p.add_argument("--init", type=Path, default=None, help="Optional BP checkpoint to evaluate gradients at.")
     p.add_argument("--split", default="train")
     p.add_argument("--sample-index", type=int, default=0)
     p.add_argument("--populations", type=int, nargs="+", default=[16, 64, 256])
@@ -85,6 +86,11 @@ def main() -> None:
         n_rays=args.n_rays,
         ray_scale=args.ray_scale,
     ).to(device)
+
+    if args.init is not None:
+        state = torch.load(args.init, map_location=device, weights_only=True)
+        model.load_state_dict(state["model"])
+        print(f"loaded checkpoint={args.init}")
 
     model.requires_grad_(True)
     model.zero_grad(set_to_none=True)
