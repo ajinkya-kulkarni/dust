@@ -62,6 +62,12 @@ def main() -> None:
     p.add_argument("--population", type=int, default=64)
     p.add_argument("--draw-chunk", type=int, default=8)
     p.add_argument("--head-credit", choices=["split", "global"], default="split")
+    p.add_argument(
+        "--spatial-credit",
+        choices=["local", "global"],
+        default="local",
+        help="Use exact token-local loss credit at eligible late sites.",
+    )
     p.add_argument("--sigma", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--mode", choices=["full", "head"], default="full")
@@ -76,7 +82,8 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     print(
-        f"device={device} head_credit={args.head_credit} image={args.image_size} "
+        f"device={device} head_credit={args.head_credit} "
+        f"spatial_credit={args.spatial_credit} image={args.image_size} "
         f"patch={args.patch_size} stride={args.output_stride} rays={args.n_rays}"
     )
 
@@ -116,6 +123,7 @@ def main() -> None:
         draw_chunk=args.draw_chunk,
         seed=args.seed + 123,
         split_head_credit=args.head_credit == "split",
+        token_local_credit=args.spatial_credit == "local",
     )
     params = [p for module in dust.modules.values() for p in module.parameters()]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
