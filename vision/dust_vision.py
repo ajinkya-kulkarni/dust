@@ -38,7 +38,6 @@ class ForwardOnlyDUST:
         self.device = next(model.parameters()).device
         if self.device.type == "mps":
             # torch.Generator(device="mps") is not supported on all PyTorch builds.
-            # Seed the global MPS RNG instead; model initialization has already happened.
             torch.manual_seed(seed)
             self.generator = None
         else:
@@ -80,8 +79,8 @@ class ForwardOnlyDUST:
     def _repeat_targets(targets: BatchTargets, repeats: int) -> BatchTargets:
         return BatchTargets(
             instances=targets.instances.repeat((repeats, 1, 1)),
-            foreground=targets.foreground.repeat((repeats, 1, 1)),
-            offsets=targets.offsets.repeat((repeats, 1, 1, 1)),
+            objectness=targets.objectness.repeat((repeats, 1, 1)),
+            rays=targets.rays.repeat((repeats, 1, 1, 1)),
         )
 
     @torch.no_grad()
