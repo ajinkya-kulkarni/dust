@@ -26,6 +26,8 @@ class ForwardOnlyDUST:
         seed: int = 123,
         split_head_credit: bool = True,
         token_local_credit: bool = True,
+        sampled_token_credit: bool = False,
+        credit_tokens: int = 16,
         ray_weight: float = 0.5,
     ) -> None:
         self.model = model
@@ -44,6 +46,8 @@ class ForwardOnlyDUST:
         self.draw_chunk = min(draw_chunk, population)
         self.split_head_credit = split_head_credit
         self.token_local_credit = token_local_credit
+        self.sampled_token_credit = sampled_token_credit
+        self.credit_tokens = credit_tokens
         self.ray_weight = ray_weight
         self.device = next(model.parameters()).device
         if self.device.type == "mps":
@@ -256,6 +260,68 @@ class ForwardOnlyDUST:
         return estimate / self.population
 
     @torch.no_grad()
+    def _estimate_sampled_token_output_error(
+        self,
+        site: str,
+        images: torch.Tensor,
+        targets: BatchTargets,
+    ) -> torch.Tensor:
+        """Estimate cross-token-site error by perturbing sampled tokens separately.
+
+        Perturbing one token at a time removes interference from perturbations at
+        other token positions while retaining the exact global downstream loss,
+        including all later attention mixing. The shared Linear weight gradient
+        is estimated from a uniform token subsample and scaled by T/M.
+        """
+        clean = self.outputs[site]
+        if clean.ndim != 3:
+            raise ValueError(f"Expected [B,T,D] output at {site}, got {tuple(clean.shape)}")
+        b, t, d = clean.shape
+        m = min(max(int(self.credit_tokens), 1), t)
+        if self.generator is not None:
+            selected = torch.randperm(t, device=clean.device, generator=self.generator)[:m]
+        else:
+            selected = torch.randperm(t, device=clean.device)[:m]
+
+        estimate = torch.zeros_like(clean, dtype=torch.float32)
+        for token_index in selected.tolist():
+            token_estimate = torch.zeros((b, d), device=clean.device, dtype=torch.float32)
+            completed = 0
+            while completed < self.population:
+                n = min(self.draw_chunk, self.population - completed)
+                noise = self._noise((n, b, d), clean.device)
+                jitter = torch.zeros(
+                    2 * n, b, t, d, device=clean.device, dtype=torch.float32
+                )
+                jitter[:n, :, token_index, :] = self.sigma * noise
+                jitter[n:, :, token_index, :] = -self.sigma * noise
+                self.jitter_site = site
+                self.jitter = jitter.reshape(2 * n * b, t, d)
+                try:
+                    expanded_images = images.repeat((2 * n, 1, 1, 1))
+                    expanded_targets = self._repeat_targets(targets, 2 * n)
+                    pred = self.model(expanded_images)
+                    losses = segmentation_loss_per_sample(
+                        pred, expanded_targets
+                    ).reshape(2, n, b)
+                finally:
+                    self.jitter_site = None
+                    self.jitter = None
+
+                directional = (losses[0] - losses[1]) / (2 * self.sigma)
+                token_estimate += torch.einsum(
+                    "nb,nbd->bd", directional.float(), noise
+                )
+                completed += n
+
+            estimate[:, token_index, :] = token_estimate / self.population
+
+        # The Linear weight gradient sums contributions from all token positions.
+        # Uniform token subsampling gives an unbiased estimator after T/M scaling.
+        estimate *= float(t) / float(m)
+        return estimate
+
+    @torch.no_grad()
     def estimate_output_error(
         self,
         site: str,
@@ -266,6 +332,8 @@ class ForwardOnlyDUST:
             return self.estimate_head_output_error_split(images, targets)
         if self._uses_token_local_credit(site):
             return self._estimate_token_local_output_error(site, images, targets)
+        if self.sampled_token_credit:
+            return self._estimate_sampled_token_output_error(site, images, targets)
 
         clean = self.outputs[site]
         if clean.ndim != 3:
