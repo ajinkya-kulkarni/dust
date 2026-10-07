@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from data import BatchTargets
-from task import segmentation_loss_per_sample
+from task import segmentation_loss_components_per_sample, segmentation_loss_per_sample
 
 
 class ForwardOnlyDUST:
@@ -20,6 +20,8 @@ class ForwardOnlyDUST:
         population: int = 64,
         draw_chunk: int = 8,
         seed: int = 123,
+        split_head_credit: bool = True,
+        ray_weight: float = 0.5,
     ) -> None:
         self.model = model
         all_sites = OrderedDict(
@@ -35,6 +37,8 @@ class ForwardOnlyDUST:
         self.sigma = sigma
         self.population = population
         self.draw_chunk = min(draw_chunk, population)
+        self.split_head_credit = split_head_credit
+        self.ray_weight = ray_weight
         self.device = next(model.parameters()).device
         if self.device.type == "mps":
             # torch.Generator(device="mps") is not supported on all PyTorch builds.
@@ -83,6 +87,87 @@ class ForwardOnlyDUST:
             rays=targets.rays.repeat((repeats, 1, 1, 1)),
         )
 
+    def _noise(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        kwargs = dict(device=device, dtype=torch.float32)
+        if self.generator is not None:
+            kwargs["generator"] = self.generator
+        return torch.randn(*shape, **kwargs)
+
+    @torch.no_grad()
+    def _estimate_head_component_error(
+        self,
+        images: torch.Tensor,
+        targets: BatchTargets,
+        active: torch.Tensor,
+        component: str,
+        scale: float,
+    ) -> torch.Tensor:
+        """Estimate head-output error using only one StarDist loss component."""
+        clean = self.outputs["head"]
+        b, t, d = clean.shape
+        estimate = torch.zeros_like(clean, dtype=torch.float32)
+        active_count = int(active.sum().item())
+        completed = 0
+
+        while completed < self.population:
+            n = min(self.draw_chunk, self.population - completed)
+            compact_noise = self._noise((n, b, t, active_count), clean.device)
+            noise = torch.zeros(n, b, t, d, device=clean.device, dtype=torch.float32)
+            noise[..., active] = compact_noise
+            signs = torch.cat((torch.ones(n), -torch.ones(n))).to(clean.device)
+            jitter = signs[:, None, None, None] * self.sigma * noise.repeat(2, 1, 1, 1)
+            self.jitter_site = "head"
+            self.jitter = jitter.reshape(2 * n * b, t, d)
+            try:
+                expanded_images = images.repeat((2 * n, 1, 1, 1))
+                expanded_targets = self._repeat_targets(targets, 2 * n)
+                pred = self.model(expanded_images)
+                obj_loss, ray_loss = segmentation_loss_components_per_sample(
+                    pred, expanded_targets
+                )
+                component_loss = obj_loss if component == "objectness" else ray_loss
+                losses = (scale * component_loss).reshape(2, n, b)
+            finally:
+                self.jitter_site = None
+                self.jitter = None
+
+            directional = (losses[0] - losses[1]) / (2 * self.sigma)
+            estimate += torch.einsum("nb,nbtd->btd", directional.float(), noise)
+            completed += n
+
+        return estimate / self.population
+
+    @torch.no_grad()
+    def estimate_head_output_error_split(
+        self,
+        images: torch.Tensor,
+        targets: BatchTargets,
+    ) -> torch.Tensor:
+        """Separate objectness and radial perturbations to avoid cross-task noise."""
+        clean = self.outputs["head"]
+        if clean.ndim != 3:
+            raise ValueError(f"Expected [B,T,D] output at head, got {tuple(clean.shape)}")
+        if not hasattr(self.model, "patch_area") or not hasattr(self.model, "n_rays"):
+            raise AttributeError("Split head credit requires model.patch_area and model.n_rays")
+
+        channels = 1 + int(self.model.n_rays)
+        expected = int(self.model.patch_area) * channels
+        if clean.shape[-1] != expected:
+            raise ValueError(
+                f"Head width {clean.shape[-1]} does not match patch_area*(1+n_rays)={expected}"
+            )
+
+        indices = torch.arange(expected, device=clean.device)
+        obj_active = (indices % channels) == 0
+        ray_active = ~obj_active
+        obj_error = self._estimate_head_component_error(
+            images, targets, obj_active, "objectness", 1.0
+        )
+        ray_error = self._estimate_head_component_error(
+            images, targets, ray_active, "rays", self.ray_weight
+        )
+        return obj_error + ray_error
+
     @torch.no_grad()
     def estimate_output_error(
         self,
@@ -90,6 +175,9 @@ class ForwardOnlyDUST:
         images: torch.Tensor,
         targets: BatchTargets,
     ) -> torch.Tensor:
+        if site == "head" and self.split_head_credit:
+            return self.estimate_head_output_error_split(images, targets)
+
         clean = self.outputs[site]
         if clean.ndim != 3:
             raise ValueError(f"Expected [B,T,D] output at {site}, got {tuple(clean.shape)}")
@@ -99,10 +187,7 @@ class ForwardOnlyDUST:
 
         while completed < self.population:
             n = min(self.draw_chunk, self.population - completed)
-            noise_kwargs = dict(device=clean.device, dtype=torch.float32)
-            if self.generator is not None:
-                noise_kwargs["generator"] = self.generator
-            noise = torch.randn(n, b, t, d, **noise_kwargs)
+            noise = self._noise((n, b, t, d), clean.device)
             signs = torch.cat((torch.ones(n), -torch.ones(n))).to(clean.device)
             jitter = signs[:, None, None, None] * self.sigma * noise.repeat(2, 1, 1, 1)
             self.jitter_site = site
