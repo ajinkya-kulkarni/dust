@@ -82,7 +82,9 @@ class ForwardOnlyDUST:
     @staticmethod
     def _repeat_targets(targets: BatchTargets, repeats: int) -> BatchTargets:
         return BatchTargets(
-            instances=targets.instances.repeat((repeats, 1, 1)),
+            # Training losses use only objectness/rays. Keep full-resolution instance
+            # labels unexpanded to avoid allocating large [2K*B,256,256] tensors.
+            instances=targets.instances,
             objectness=targets.objectness.repeat((repeats, 1, 1)),
             rays=targets.rays.repeat((repeats, 1, 1, 1)),
         )
@@ -147,14 +149,17 @@ class ForwardOnlyDUST:
         clean = self.outputs["head"]
         if clean.ndim != 3:
             raise ValueError(f"Expected [B,T,D] output at head, got {tuple(clean.shape)}")
-        if not hasattr(self.model, "patch_area") or not hasattr(self.model, "n_rays"):
-            raise AttributeError("Split head credit requires model.patch_area and model.n_rays")
+        if not hasattr(self.model, "output_positions_per_token") or not hasattr(self.model, "n_rays"):
+            raise AttributeError(
+                "Split head credit requires model.output_positions_per_token and model.n_rays"
+            )
 
         channels = 1 + int(self.model.n_rays)
-        expected = int(self.model.patch_area) * channels
+        expected = int(self.model.output_positions_per_token) * channels
         if clean.shape[-1] != expected:
             raise ValueError(
-                f"Head width {clean.shape[-1]} does not match patch_area*(1+n_rays)={expected}"
+                f"Head width {clean.shape[-1]} does not match "
+                f"output_positions_per_token*(1+n_rays)={expected}"
             )
 
         indices = torch.arange(expected, device=clean.device)
