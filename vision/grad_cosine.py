@@ -15,6 +15,20 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     return torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
 
 
+def norm_ratio(a: torch.Tensor, b: torch.Tensor) -> float:
+    return (a.norm() / b.norm().clamp_min(1e-12)).item()
+
+
+def split_head_rows(
+    grad: torch.Tensor,
+    patch_area: int,
+    n_rays: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split flattened dense-head rows into objectness and radial-output rows."""
+    grad = grad.reshape(patch_area, 1 + n_rays, grad.shape[-1])
+    return grad[:, 0], grad[:, 1:]
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--populations", type=int, nargs="+", default=[16, 64, 256, 1024])
@@ -48,6 +62,13 @@ def main() -> None:
     model.requires_grad_(False)
 
     print(f"site={args.site} exact_grad_norm={true_grad.norm().item():.6f}")
+    if args.site == "head":
+        true_obj, true_rays = split_head_rows(true_grad, model.patch_area, model.n_rays)
+        print(
+            f"  exact_obj_norm={true_obj.norm().item():.6f} "
+            f"exact_rays_norm={true_rays.norm().item():.6f}"
+        )
+
     for population in args.populations:
         dust = ForwardOnlyDUST(
             model,
@@ -61,10 +82,20 @@ def main() -> None:
             est, _ = dust.estimate_site_gradient(args.site, images, targets, capture=True)
         finally:
             dust.close()
-        print(
+
+        line = (
             f"population={population:5d} cosine={cosine(est, true_grad):.4f} "
-            f"norm_ratio={(est.norm() / true_grad.norm().clamp_min(1e-12)).item():.4f}"
+            f"norm_ratio={norm_ratio(est, true_grad):.4f}"
         )
+        if args.site == "head":
+            est_obj, est_rays = split_head_rows(est, model.patch_area, model.n_rays)
+            line += (
+                f" obj_cos={cosine(est_obj, true_obj):.4f}"
+                f" obj_norm={norm_ratio(est_obj, true_obj):.4f}"
+                f" ray_cos={cosine(est_rays, true_rays):.4f}"
+                f" ray_norm={norm_ratio(est_rays, true_rays):.4f}"
+            )
+        print(line)
 
 
 if __name__ == "__main__":
