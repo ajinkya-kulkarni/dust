@@ -22,7 +22,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--sigma", type=float, default=0.1)
     p.add_argument("--draw-chunk", type=int, default=8)
-    p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
+    p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
