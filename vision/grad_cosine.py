@@ -47,9 +47,19 @@ def main() -> None:
     p.add_argument("--head-credit", choices=["split", "global"], default="split")
     p.add_argument(
         "--spatial-credit",
-        choices=["local", "global"],
+        choices=["local", "sampled", "global"],
         default="local",
-        help="Use exact token-local loss credit at eligible late sites, or the old image-global scalar credit.",
+        help=(
+            "local: exact token-local credit at eligible late sites and global fallback; "
+            "sampled: same local credit plus one-token-at-a-time subsampling for cross-token sites; "
+            "global: old image-global scalar credit."
+        ),
+    )
+    p.add_argument(
+        "--credit-tokens",
+        type=int,
+        default=16,
+        help="Number of token positions sampled at cross-token sites when --spatial-credit sampled.",
     )
     p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
     p.add_argument("--seed", type=int, default=0)
@@ -153,7 +163,9 @@ def main() -> None:
             draw_chunk=args.draw_chunk,
             seed=args.seed + 1000,
             split_head_credit=args.head_credit == "split",
-            token_local_credit=args.spatial_credit == "local",
+            token_local_credit=args.spatial_credit in {"local", "sampled"},
+            sampled_token_credit=args.spatial_credit == "sampled",
+            credit_tokens=args.credit_tokens,
         )
         try:
             est, _ = dust.estimate_site_gradient(args.site, images, targets, capture=True)
