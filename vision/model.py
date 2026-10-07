@@ -58,7 +58,7 @@ class Block(nn.Module):
 
 
 class TinyInstanceTransformer(nn.Module):
-    """All trainable tensors live in nn.Linear modules, which keeps DUST adaptation simple."""
+    """Tiny all-Linear transformer with a StarDist-like dense output head."""
 
     def __init__(
         self,
@@ -67,17 +67,19 @@ class TinyInstanceTransformer(nn.Module):
         dim: int = 64,
         depth: int = 2,
         heads: int = 4,
+        n_rays: int = 16,
     ) -> None:
         super().__init__()
         if image_size % patch_size:
             raise ValueError("image_size must be divisible by patch_size")
         self.image_size = image_size
         self.patch_size = patch_size
+        self.n_rays = n_rays
         self.grid = image_size // patch_size
         self.patch_area = patch_size * patch_size
         self.patch_embed = nn.Linear(self.patch_area, dim, bias=False)
         self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
-        self.head = nn.Linear(dim, self.patch_area * 3, bias=False)
+        self.head = nn.Linear(dim, self.patch_area * (1 + n_rays), bias=False)
         self.register_buffer("pos", fixed_2d_position_embedding(self.grid, dim), persistent=False)
 
     def patchify(self, images: torch.Tensor) -> torch.Tensor:
@@ -85,14 +87,17 @@ class TinyInstanceTransformer(nn.Module):
         return patches.transpose(1, 2)
 
     def unpatchify(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        b, t, _ = raw.shape
+        b, _, _ = raw.shape
         p = self.patch_size
         g = self.grid
-        raw = raw.reshape(b, g, g, p, p, 3)
-        raw = raw.permute(0, 1, 3, 2, 4, 5).reshape(b, self.image_size, self.image_size, 3)
-        fg_logits = raw[..., 0]
-        offsets = torch.tanh(raw[..., 1:3]).permute(0, 3, 1, 2)
-        return fg_logits, offsets
+        channels = 1 + self.n_rays
+        raw = raw.reshape(b, g, g, p, p, channels)
+        raw = raw.permute(0, 1, 3, 2, 4, 5).reshape(
+            b, self.image_size, self.image_size, channels
+        )
+        obj_logits = raw[..., 0]
+        rays = F.softplus(raw[..., 1:]).permute(0, 3, 1, 2)
+        return obj_logits, rays
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         x = self.patch_embed(self.patchify(images))
@@ -100,5 +105,5 @@ class TinyInstanceTransformer(nn.Module):
         for block in self.blocks:
             x = block(x)
         raw = self.head(rms_norm(x))
-        fg_logits, offsets = self.unpatchify(raw)
-        return {"fg_logits": fg_logits, "offsets": offsets, "token_raw": raw}
+        obj_logits, rays = self.unpatchify(raw)
+        return {"obj_logits": obj_logits, "rays": rays, "token_raw": raw}
