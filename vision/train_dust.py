@@ -22,8 +22,8 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--mode", choices=["full", "head"], default="full")
     p.add_argument("--init", type=Path, help="Optional checkpoint from train_bp.py; recommended for --mode head")
-    p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
-    p.add_argument("--output", type=Path, default=Path("runs/vision-dust.pt"))
+    p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
+    p.add_argument("--output", type=Path, default=Path("runs/vision-stardist-dust.pt"))
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -66,7 +66,7 @@ def main() -> None:
             loss = dust.step(images, targets, optimizer)
             if step == 1 or step % 10 == 0 or step == args.steps:
                 metrics = evaluate(model, val_loader, device)
-                print(f"step={step:4d} train={loss:.4f} val={metrics['loss']:.4f} dice={metrics['dice']:.3f} pq={metrics['pq']:.3f}")
+                print(f"step={step:4d} train={loss:.4f} val={metrics['loss']:.4f} dice={metrics['dice']:.3f} pq={metrics['pq']:.3f} ray_mae={metrics['ray_mae']:.3f}")
     finally:
         dust.close()
 
