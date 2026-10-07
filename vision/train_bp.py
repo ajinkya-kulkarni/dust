@@ -16,8 +16,8 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
-    p.add_argument("--output", type=Path, default=Path("runs/vision-bp.pt"))
+    p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "cpu"))
+    p.add_argument("--output", type=Path, default=Path("runs/vision-stardist-bp.pt"))
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -47,7 +47,7 @@ def main() -> None:
         optimizer.step()
         if step == 1 or step % 50 == 0 or step == args.steps:
             metrics = evaluate(model, val_loader, device)
-            print(f"step={step:4d} train={loss.item():.4f} val={metrics['loss']:.4f} dice={metrics['dice']:.3f} pq={metrics['pq']:.3f}")
+            print(f"step={step:4d} train={loss.item():.4f} val={metrics['loss']:.4f} dice={metrics['dice']:.3f} pq={metrics['pq']:.3f} ray_mae={metrics['ray_mae']:.3f}")
             model.train()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
