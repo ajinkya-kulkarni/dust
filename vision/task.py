@@ -33,6 +33,67 @@ def segmentation_loss_components_per_sample(
     return obj_loss, ray_loss
 
 
+def _grid_map_to_token_blocks(
+    values: torch.Tensor,
+    token_grid: int,
+    local_grid: int,
+) -> torch.Tensor:
+    """Map [B,H,W] output-grid values to [B,T,P] encoder-token blocks."""
+    if values.ndim != 3:
+        raise ValueError(f"Expected [B,H,W], got {tuple(values.shape)}")
+    b, h, w = values.shape
+    expected = token_grid * local_grid
+    if h != expected or w != expected:
+        raise ValueError(
+            f"Output grid {(h, w)} does not match token_grid*local_grid={expected}"
+        )
+    return (
+        values.reshape(b, token_grid, local_grid, token_grid, local_grid)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(b, token_grid * token_grid, local_grid * local_grid)
+    )
+
+
+def segmentation_loss_components_per_token(
+    prediction: dict[str, torch.Tensor],
+    targets: BatchTargets,
+    *,
+    token_grid: int,
+    local_grid: int,
+    obj_pos_weight: float = 4.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact additive loss contributions for each encoder token.
+
+    Returns [B,T] objectness and ray contributions whose sums over T equal
+    segmentation_loss_components_per_sample(). This is used for token-local
+    DUST credit at sites after the final cross-token mixing operation.
+    """
+    obj_logits = prediction["obj_logits"]
+    rays = prediction["rays"]
+    pos_weight = torch.as_tensor(
+        obj_pos_weight, device=obj_logits.device, dtype=obj_logits.dtype
+    )
+
+    obj_map = F.binary_cross_entropy_with_logits(
+        obj_logits,
+        targets.objectness,
+        reduction="none",
+        pos_weight=pos_weight,
+    )
+    obj_blocks = _grid_map_to_token_blocks(obj_map, token_grid, local_grid)
+    # Global objectness loss is mean over the complete output grid.
+    obj_token = obj_blocks.sum(-1) / obj_map[0].numel()
+
+    ray_map = F.smooth_l1_loss(rays, targets.rays, reduction="none").mean(1)
+    mask = targets.objectness > 0
+    masked_ray_map = ray_map * mask
+    ray_blocks = _grid_map_to_token_blocks(masked_ray_map, token_grid, local_grid)
+    # Match the per-sample global foreground normalization exactly.
+    denom = mask.flatten(1).sum(1).clamp_min(1).to(ray_map.dtype)
+    ray_token = ray_blocks.sum(-1) / denom[:, None]
+    return obj_token, ray_token
+
+
 def segmentation_loss_per_sample(
     prediction: dict[str, torch.Tensor],
     targets: BatchTargets,
