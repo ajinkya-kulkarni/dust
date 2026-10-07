@@ -18,6 +18,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--population", type=int, default=64)
     p.add_argument("--draw-chunk", type=int, default=8)
+    p.add_argument("--head-credit", choices=["split", "global"], default="split")
     p.add_argument("--sigma", type=float, default=0.1)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--mode", choices=["full", "head"], default="full")
@@ -29,7 +30,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    print(f"device={device}")
+    print(f"device={device} head_credit={args.head_credit}")
     train_ds = SyntheticInstancesDataset(length=max(args.steps * args.batch_size, 1024), seed=2000)
     val_ds = SyntheticInstancesDataset(length=64, seed=900000)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_batch)
@@ -49,6 +50,7 @@ def main() -> None:
         population=args.population,
         draw_chunk=args.draw_chunk,
         seed=args.seed + 123,
+        split_head_credit=args.head_credit == "split",
     )
     params = [p for m in dust.modules.values() for p in m.parameters()]
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
