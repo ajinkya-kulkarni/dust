@@ -22,12 +22,13 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--sigma", type=float, default=0.1)
     p.add_argument("--draw-chunk", type=int, default=8)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default=("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"))
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    print(f"device={device}")
     loader = DataLoader(
         SyntheticInstancesDataset(length=args.batch_size, seed=424242),
         batch_size=args.batch_size,
