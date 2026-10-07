@@ -74,7 +74,8 @@ def normalized_instance_distance(labels: np.ndarray) -> np.ndarray:
         y0, y1 = max(int(ys.min()) - 1, 0), min(int(ys.max()) + 2, labels.shape[0])
         x0, x1 = max(int(xs.min()) - 1, 0), min(int(xs.max()) + 2, labels.shape[1])
         mask = labels[y0:y1, x0:x1] == idx
-        distance = distance_transform_edt(mask).astype(np.float32)
+        padded = np.pad(mask, 1, mode="constant", constant_values=False)
+        distance = distance_transform_edt(padded)[1:-1, 1:-1].astype(np.float32)
         peak = float(distance.max())
         if peak > 0:
             distance /= peak
@@ -210,7 +211,7 @@ class DSB2018Dataset(Dataset):
             )
 
         cache_tag = (
-            f"v1_size{image_size}_s{output_stride}_o{grid_offset}"
+            f"v2_size{image_size}_s{output_stride}_o{grid_offset}"
             f"_r{n_rays}_scale{ray_scale:g}"
         )
         self.cache_dir = self.root / ".dust_stardist_cache" / cache_tag / split
