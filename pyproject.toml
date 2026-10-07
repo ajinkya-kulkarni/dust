@@ -1,0 +1,14 @@
+[project]
+name = "dust"
+version = "0.1.0"
+description = "DUST forward-only transformer training experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.10.0",
+    "tokenizers==0.23.1",
+    "datasets==4.8.4",
+]
+
+[tool.uv]
+package = false
