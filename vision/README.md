@@ -159,7 +159,34 @@ combine both activation-error estimates
   -> reconstruct head weight gradient
 ```
 
-Shared transformer layers still use the complete StarDist loss.
+### Exact token-local spatial credit
+
+On real 256x256 DSB2018 patches, the old image-global scalar reward becomes too noisy: one scalar loss change was being used to assign credit to all 256 transformer tokens at once.
+
+For sites after the final cross-token mixing operation, the downstream StarDist loss decomposes exactly by encoder token. This branch therefore uses per-token loss contributions at these sites:
+
+```text
+head
+blocks.1.attn.proj
+blocks.1.fc1
+blocks.1.fc2
+```
+
+Each encoder token owns a 4x4 block of the 64x64 StarDist grid. Objectness and ray loss contributions are computed for that block using the same global normalization as the ordinary loss, so summing all 256 token contributions reproduces the original per-sample loss.
+
+The perturbation population is still evaluated in parallel across all tokens, but token `t` receives only the loss change from token `t`'s output block:
+
+```text
+global credit (old):
+all token perturbations -> one image loss scalar -> credit every token
+
+token-local credit (new):
+token t perturbation -> token t's exact additive loss contribution -> credit token t
+```
+
+No approximation to the training objective is introduced at these eligible sites. Earlier sites such as `patch_embed`, block 0, and `blocks.1.attn.qkv` still require image-global credit because later attention mixes tokens.
+
+Use `--spatial-credit global` to reproduce the old estimator for comparison. The default is `--spatial-credit local`.
 
 ## Setup
 
@@ -233,7 +260,9 @@ Once BP learns:
 ```bash
 uv run python vision/grad_cosine.py \
   --data-dir ../FluoFuse_dsb2018_stratified \
+  --init runs/dsb2018-stardist-bp-500.pt \
   --device cpu \
+  --spatial-credit local \
   --populations 16 64 256
 ```
 
@@ -248,13 +277,17 @@ Internal sites can also be checked:
 ```bash
 uv run python vision/grad_cosine.py \
   --data-dir ../FluoFuse_dsb2018_stratified \
+  --init runs/dsb2018-stardist-bp-500.pt \
   --device cpu \
+  --spatial-credit local \
   --site blocks.1.fc2 \
   --populations 16 64 256
 
 uv run python vision/grad_cosine.py \
   --data-dir ../FluoFuse_dsb2018_stratified \
+  --init runs/dsb2018-stardist-bp-500.pt \
   --device cpu \
+  --spatial-credit local \
   --site patch_embed \
   --populations 16 64 256
 ```
@@ -273,6 +306,7 @@ uv run python vision/train_dust.py \
   --steps 10 \
   --lr 3e-4 \
   --head-credit split \
+  --spatial-credit local \
   --output runs/dsb2018-stardist-dust-p64-smoke.pt
 ```
 
