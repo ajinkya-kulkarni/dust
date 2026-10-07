@@ -28,7 +28,7 @@ def segmentation_loss_components_per_sample(
     ).flatten(1).mean(1)
 
     ray = F.smooth_l1_loss(rays, targets.rays, reduction="none").mean(1)
-    mask = targets.instances > 0
+    mask = targets.objectness > 0
     ray_loss = (ray * mask).flatten(1).sum(1) / mask.flatten(1).sum(1).clamp_min(1)
     return obj_loss, ray_loss
 
@@ -45,51 +45,61 @@ def segmentation_loss_per_sample(
     return obj_loss + ray_weight * ray_loss
 
 
-def ray_mae(prediction: dict[str, torch.Tensor], targets: BatchTargets) -> torch.Tensor:
-    err = (prediction["rays"] - targets.rays).abs().mean(1)
-    mask = targets.instances > 0
+def ray_mae(
+    prediction: dict[str, torch.Tensor],
+    targets: BatchTargets,
+    ray_scale: float,
+) -> torch.Tensor:
+    err = (prediction["rays"] - targets.rays).abs().mean(1) * ray_scale
+    mask = targets.objectness > 0
     return (err * mask).sum() / mask.sum().clamp_min(1)
 
 
 def _star_mask(
-    cy: int,
-    cx: int,
-    rays: torch.Tensor,
+    cy: float,
+    cx: float,
+    rays_px: torch.Tensor,
     yy: torch.Tensor,
     xx: torch.Tensor,
 ) -> torch.Tensor:
-    """Rasterize a star-convex shape by interpolating adjacent radial predictions."""
-    n_rays = rays.numel()
-    dy = yy - float(cy)
-    dx = xx - float(cx)
+    """Rasterize a star-convex polygon by interpolating adjacent radial predictions."""
+    n_rays = rays_px.numel()
+    dy = yy - cy
+    dx = xx - cx
     distance = torch.sqrt(dy.square() + dx.square())
     angle = torch.remainder(torch.atan2(dy, dx), 2.0 * math.pi)
     ray_pos = angle * (n_rays / (2.0 * math.pi))
     i0 = torch.floor(ray_pos).long() % n_rays
     i1 = (i0 + 1) % n_rays
     frac = ray_pos - torch.floor(ray_pos)
-    allowed = rays[i0] * (1.0 - frac) + rays[i1] * frac
+    allowed = rays_px[i0] * (1.0 - frac) + rays_px[i1] * frac
     return distance <= allowed
 
 
 def decode_instances(
     prediction: dict[str, torch.Tensor],
+    *,
+    image_size: int = 256,
+    output_stride: int = 4,
+    grid_offset: int = 2,
+    ray_scale: float = 16.0,
     obj_threshold: float = 0.30,
     nms_iou: float = 0.30,
-    max_candidates: int = 64,
-    max_instances: int = 16,
+    max_candidates: int = 512,
+    max_instances: int = 160,
 ) -> torch.Tensor:
-    """StarDist-like local maxima, star rasterization, and overlap NMS."""
+    """Decode 64x64 StarDist predictions into full-resolution 256x256 instances."""
     prob = prediction["obj_logits"].sigmoid()
     rays = prediction["rays"]
-    b, h, w = prob.shape
+    b, gh, gw = prob.shape
+
     yy, xx = torch.meshgrid(
-        torch.arange(h, device=prob.device, dtype=torch.float32),
-        torch.arange(w, device=prob.device, dtype=torch.float32),
+        torch.arange(image_size, device=prob.device, dtype=torch.float32),
+        torch.arange(image_size, device=prob.device, dtype=torch.float32),
         indexing="ij",
     )
-    out = torch.zeros(b, h, w, dtype=torch.long, device=prob.device)
-    max_radius = math.sqrt(h * h + w * w)
+    out = torch.zeros(b, image_size, image_size, dtype=torch.long, device=prob.device)
+    max_radius = math.sqrt(2.0) * image_size
 
     for bi in range(b):
         pooled = F.max_pool2d(prob[bi][None, None], 3, stride=1, padding=1)[0, 0]
@@ -97,14 +107,17 @@ def decode_instances(
         candidates = torch.nonzero(is_peak, as_tuple=False)
         if candidates.numel() == 0:
             continue
+
         scores = prob[bi, candidates[:, 0], candidates[:, 1]]
         order = torch.argsort(scores, descending=True)[:max_candidates]
         kept_masks: list[torch.Tensor] = []
 
         for idx in order:
-            cy = int(candidates[idx, 0])
-            cx = int(candidates[idx, 1])
-            radial = rays[bi, :, cy, cx].clamp(0.0, max_radius)
+            gy = int(candidates[idx, 0])
+            gx = int(candidates[idx, 1])
+            cy = float(grid_offset + gy * output_stride)
+            cx = float(grid_offset + gx * output_stride)
+            radial = (rays[bi, :, gy, gx] * ray_scale).clamp(0.0, max_radius)
             mask = _star_mask(cy, cx, radial, yy, xx)
             if mask.sum().item() < 4:
                 continue
@@ -123,9 +136,10 @@ def decode_instances(
             if len(kept_masks) >= max_instances:
                 break
 
-        # Candidates are score-sorted, so higher-confidence stars win overlaps.
+        # Candidates are score sorted; higher-confidence masks win overlap pixels.
         for label, mask in enumerate(kept_masks, start=1):
             out[bi][mask & (out[bi] == 0)] = label
+
     return out
 
 
@@ -144,6 +158,7 @@ def pq_single(pred: torch.Tensor, gt: torch.Tensor, iou_threshold: float = 0.5) 
     gt_ids = gt_ids[gt_ids > 0]
     if len(pred_ids) == 0 and len(gt_ids) == 0:
         return 1.0
+
     pairs = []
     for pi in pred_ids.tolist():
         pm = pred == pi
@@ -156,6 +171,7 @@ def pq_single(pred: torch.Tensor, gt: torch.Tensor, iou_threshold: float = 0.5) 
             iou = inter / union
             if iou > iou_threshold:
                 pairs.append((iou, pi, gi))
+
     pairs.sort(reverse=True)
     used_p, used_g, matched = set(), set(), []
     for iou, pi, gi in pairs:
@@ -164,6 +180,7 @@ def pq_single(pred: torch.Tensor, gt: torch.Tensor, iou_threshold: float = 0.5) 
         used_p.add(pi)
         used_g.add(gi)
         matched.append(iou)
+
     tp = len(matched)
     fp = len(pred_ids) - tp
     fn = len(gt_ids) - tp
@@ -181,11 +198,18 @@ def evaluate(model: nn.Module, loader, device: torch.device | str) -> dict[str, 
         targets = targets.to(device)
         pred = model(images)
         losses.append(segmentation_loss_per_sample(pred, targets).mean().item())
-        ray_errors.append(ray_mae(pred, targets).item())
-        decoded = decode_instances(pred)
+        ray_errors.append(ray_mae(pred, targets, ray_scale=float(model.ray_scale)).item())
+        decoded = decode_instances(
+            pred,
+            image_size=int(model.image_size),
+            output_stride=int(model.output_stride),
+            grid_offset=int(model.grid_offset),
+            ray_scale=float(model.ray_scale),
+        )
         dices.append(foreground_dice(decoded, targets).item())
         for bi in range(images.shape[0]):
             pqs.append(pq_single(decoded[bi].cpu(), targets.instances[bi].cpu()))
+
     return {
         "loss": sum(losses) / max(len(losses), 1),
         "dice": sum(dices) / max(len(dices), 1),
