@@ -35,7 +35,14 @@ class ForwardOnlyDUST:
         self.sigma = sigma
         self.population = population
         self.draw_chunk = min(draw_chunk, population)
-        self.generator = torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
+        self.device = next(model.parameters()).device
+        if self.device.type == "mps":
+            # torch.Generator(device="mps") is not supported on all PyTorch builds.
+            # Seed the global MPS RNG instead; model initialization has already happened.
+            torch.manual_seed(seed)
+            self.generator = None
+        else:
+            self.generator = torch.Generator(device=self.device).manual_seed(seed)
         self.inputs: dict[str, torch.Tensor] = {}
         self.outputs: dict[str, torch.Tensor] = {}
         self.capturing = False
@@ -93,12 +100,10 @@ class ForwardOnlyDUST:
 
         while completed < self.population:
             n = min(self.draw_chunk, self.population - completed)
-            noise = torch.randn(
-                n, b, t, d,
-                device=clean.device,
-                dtype=torch.float32,
-                generator=self.generator,
-            )
+            noise_kwargs = dict(device=clean.device, dtype=torch.float32)
+            if self.generator is not None:
+                noise_kwargs["generator"] = self.generator
+            noise = torch.randn(n, b, t, d, **noise_kwargs)
             signs = torch.cat((torch.ones(n), -torch.ones(n))).to(clean.device)
             jitter = signs[:, None, None, None] * self.sigma * noise.repeat(2, 1, 1, 1)
             self.jitter_site = site
